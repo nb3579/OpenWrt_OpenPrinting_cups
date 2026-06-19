@@ -1,4 +1,4 @@
-name: Build CUPSdrive for OpenWrt
+name: Build CUPS for OpenWrt
 
 on:
   push:
@@ -19,11 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 您的路由器芯片 MT7620A 对应的精准架构（重点跑这一个即可）
+          # 您的路由器芯片 MT7620A 对应的精准架构
           - arch: mipsel_24kc_mt7620
             target: ramips
             subtarget: mt7620
-          # 如果有其他测试设备，可以保留或自行删减
+          # 可选保留的其他常用架构，如果不需要可以自行删除
           - arch: x86_64
             target: x86
             subtarget: "64"
@@ -71,15 +71,24 @@ jobs:
           FEED_DIR: ${{ github.workspace }}
         run: |
           cd ${{ steps.sdk.outputs.dir }}
+          
+          # 1. 如果 feeds.conf 不存在，才从模板复制
           [ -f feeds.conf ] || cp feeds.conf.default feeds.conf
           
-          # 1. 引入官方同版本的 packages 库源，确保编译 cups-filters 时所需的依赖（如 glib2, libpng）能被拉取
-          echo "src-git packages https://github.com/openwrt/packages.git;openwrt-${OPENWRT_VERSION}" >> feeds.conf
+          # 2. 【核心修复】幂等安全检查：只有当 feeds.conf 里面完全没有 packages 关键字时，才追加写入
+          # 如果 SDK 自带的 feeds.conf 已经声明了 packages，则直接跳过，完美规避 Duplicate feed name 报错
+          if ! grep -q "packages" feeds.conf; then
+            echo "src-git packages https://github.com/openwrt/packages.git;openwrt-${OPENWRT_VERSION}" >> feeds.conf
+          fi
+          
+          # 3. 清理掉可能残存的旧 openprinting_cups 声明，并强行注入本地 feed 的绝对路径
+          sed -i '/openprinting_cups/d' feeds.conf
           echo "src-link openprinting_cups $FEED_DIR" >> feeds.conf
           
+          # 4. 强行刷新 Feed 索引
           ./scripts/feeds update -a
           
-          # 2. 精准安装本地 feed 里的 cups 以及 packages 库里的核心过滤器组件
+          # 5. 精准安装本地 feed 里的 cups 以及官方 packages 库里的过滤器组件
           ./scripts/feeds install -p openprinting_cups -f cups
           ./scripts/feeds install -p packages cups-filters
           
@@ -89,17 +98,17 @@ jobs:
         run: |
           cd ${{ steps.sdk.outputs.dir }}
           
-          # 优先编译你苦苦寻找的过滤器（翻译官组件）
+          # 优先全量编译您需要的过滤器（转换器组件）
           make package/cups-filters/compile -j$(nproc) V=s || true
           
-          # 接着编译核心主程序
+          # 紧接着编译核心主程序
           make package/cups/compile -j$(nproc) V=s
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
           name: cups-${{ matrix.arch }}-packages
-          # 核心修复：使用通配符捕获该架构 bin 下生成的所有 ipk（包括 cups-filters 和依赖库）
+          # 使用通配符捕获该架构 bin 目录下生成的所有 ipk（包含 cups-full、cups-filters 及其相关依赖库）
           path: |
             openwrt-sdk-*/bin/**/*.ipk
           if-no-files-found: warn

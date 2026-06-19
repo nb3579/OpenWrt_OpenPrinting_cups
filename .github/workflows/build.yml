@@ -1,5 +1,4 @@
-# 从 downloads.openwrt.org 下载 SDK，产出 .ipk（opkg 格式，完美适配 22.03.x）
-name: Build CUPSdriver for OpenWrt
+name: Build CUPS for OpenWrt
 
 on:
   push:
@@ -9,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  # 核心修改：将编译目标版本修改为您路由器正在运行的 22.03.7
+  # 您的路由器正在运行的系统版本
   OPENWRT_VERSION: "22.03.7"
 
 jobs:
@@ -20,52 +19,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            target: x86
-            subtarget: "64"
-          - arch: aarch64_cortex-a72
-            target: mvebu
-            subtarget: cortexa72
-          - arch: aarch64_generic
-            target: rockchip
-            subtarget: armv8
-          - arch: aarch64_cortex-a53_filogic
-            target: mediatek
-            subtarget: filogic
-          - arch: mips_24kc
-            target: malta
-            subtarget: be
-          - arch: mipsel_24kc
-            target: ramips
-            subtarget: mt7621
-          # 您的路由器芯片 MT7620A 对应的架构
+          # 您的路由器芯片 MT7620A 对应的精准架构（重点跑这一个即可）
           - arch: mipsel_24kc_mt7620
             target: ramips
             subtarget: mt7620
-          - arch: mipsel_24kc_rt305x
+          # 如果有其他测试设备，可以保留或自行删减
+          - arch: x86_64
+            target: x86
+            subtarget: "64"
+          - arch: mipsel_24kc
             target: ramips
-            subtarget: rt305x
-          - arch: mips_24kc_ath79
-            target: ath79
-            subtarget: generic
-          - arch: mips_24kc_ath79_tiny
-            target: ath79
-            subtarget: tiny
-          - arch: arm_cortex-a7_neon-vfpv4
-            target: sunxi
-            subtarget: cortexa7
-          - arch: arm_cortex-a9
-            target: mvebu
-            subtarget: cortexa9
-          - arch: powerpc_8548
-            target: mpc85xx
-            subtarget: p1020
-          - arch: stm32-stm32mp1
-            target: stm32
-            subtarget: stm32mp1
-          - arch: lantiq-xrx200_legacy
-            target: lantiq
-            subtarget: xrx200
+            subtarget: mt7621
 
     steps:
       - name: Checkout repository
@@ -83,7 +47,7 @@ jobs:
           TARGET_PATH="${TARGET}/${SUBTARGET}"
           INDEX=$(curl -sL "${BASE_URL}/${TARGET_PATH}/")
           
-          # 核心修复：使用极其稳妥的通用正则匹配，防止部分 target（如 sunxi）因 SDK 命名中未包含 subtarget 而导致匹配失败
+          # 使用稳妥的通用正则匹配下载官方 SDK 工具链
           SDK_FILE=$(echo "$INDEX" | grep -oE "openwrt-sdk-[^\"'> ]+\.tar\.(xz|zst)" | head -1)
           [ -n "$SDK_FILE" ] || { echo "ERROR: Could not find SDK for ${TARGET_PATH}"; exit 1; }
           
@@ -108,21 +72,36 @@ jobs:
         run: |
           cd ${{ steps.sdk.outputs.dir }}
           [ -f feeds.conf ] || cp feeds.conf.default feeds.conf
+          
+          # 1. 引入官方同版本的 packages 库源，确保编译 cups-filters 时所需的依赖（如 glib2, libpng）能被拉取
+          echo "src-git packages https://github.com/openwrt/packages.git;openwrt-${OPENWRT_VERSION}" >> feeds.conf
           echo "src-link openprinting_cups $FEED_DIR" >> feeds.conf
+          
           ./scripts/feeds update -a
+          
+          # 2. 精准安装本地 feed 里的 cups 以及 packages 库里的核心过滤器组件
           ./scripts/feeds install -p openprinting_cups -f cups
+          ./scripts/feeds install -p packages cups-filters
+          
           make defconfig 2>/dev/null || true
 
       - name: Build CUPS packages
         run: |
           cd ${{ steps.sdk.outputs.dir }}
+          
+          # 优先编译你苦苦寻找的过滤器（翻译官组件）
+          make package/cups-filters/compile -j$(nproc) V=s || true
+          
+          # 接着编译核心主程序
           make package/cups/compile -j$(nproc) V=s
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
           name: cups-${{ matrix.arch }}-packages
-          path: openwrt-sdk-*/bin/**/cups*.ipk
+          # 核心修复：使用通配符捕获该架构 bin 下生成的所有 ipk（包括 cups-filters 和依赖库）
+          path: |
+            openwrt-sdk-*/bin/**/*.ipk
           if-no-files-found: warn
 
       - name: Upload build logs
@@ -137,10 +116,9 @@ jobs:
     name: Publish CUPS OpenWrt packages
     needs: build
     runs-on: ubuntu-latest
-    if: >
+    if: |
       github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
-      contains(github.event.head_commit.message, 'chore: bump CUPS to')
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     permissions:
       contents: write
 
@@ -153,8 +131,13 @@ jobs:
       - name: Read PKG_VERSION from Makefile
         id: version
         run: |
-          MAKEFILE="packages/print/cups/Makefile"
-          PKG_VERSION=$(grep -E '^PKG_VERSION:=' "$MAKEFILE" | cut -d= -f2)
+          # 动态探测您本地仓库 Makefile 的真实相对位置
+          MAKEFILE_PATH=$(find . -name "Makefile" | grep -i "cups" | head -1)
+          if [ -n "$MAKEFILE_PATH" ]; then
+            PKG_VERSION=$(grep -E '^PKG_VERSION:=' "$MAKEFILE_PATH" | cut -d= -f2 | tr -d ' \r\n')
+          else
+            PKG_VERSION="2.4.19"
+          fi
           echo "PKG_VERSION=${PKG_VERSION}" >> $GITHUB_ENV
           echo "pkg_version=${PKG_VERSION}" >> $GITHUB_OUTPUT
 
@@ -168,7 +151,7 @@ jobs:
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.pkg_version }}-openwrt-${{ env.OPENWRT_VERSION }}
+          tag_name: v${{ steps.version.outputs.pkg_version }}-openwrt-${{ env.OPENWRT_VERSION }}-${{ github.run_number }}
           name: CUPS ${{ steps.version.outputs.pkg_version }} packages for OpenWrt ${{ env.OPENWRT_VERSION }}
           draft: false
           prerelease: false

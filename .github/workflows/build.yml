@@ -1,4 +1,4 @@
-name: Build CUPS for OpenWrt
+name: Build CUPSdrive for OpenWrt
 
 on:
   push:

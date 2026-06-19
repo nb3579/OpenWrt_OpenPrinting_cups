@@ -1,153 +1,25 @@
-name: Build CUPS for OpenWrt
-
-on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
-  workflow_dispatch:
-
-env:
-  OPENWRT_VERSION: "22.03.7"
-
-jobs:
-  build:
-    name: ${{ matrix.target }}/${{ matrix.subtarget }} build
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # 您的路由器芯片 MT7620A 对应的精准架构（重点跑这一个即可）
-          - arch: mipsel_24kc_mt7620
-            target: ramips
-            subtarget: mt7620
-          # 其他可选保留架构
-          - arch: x86_64
-            target: x86
-            subtarget: "64"
-          - arch: mipsel_24kc
-            target: ramips
-            subtarget: mt7621
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download and extract SDK
-        id: sdk
-        env:
-          TARGET: ${{ matrix.target }}
-          SUBTARGET: ${{ matrix.subtarget }}
-        run: |
-          BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
-          TARGET_PATH="${TARGET}/${SUBTARGET}"
-          INDEX=$(curl -sL "${BASE_URL}/${TARGET_PATH}/")
-          
-          SDK_FILE=$(echo "$INDEX" | grep -oE "openwrt-sdk-[^\"'> ]+\.tar\.(xz|zst)" | head -1)
-          [ -n "$SDK_FILE" ] || { echo "ERROR: Could not find SDK for ${TARGET_PATH}"; exit 1; }
-          
-          EXT="${SDK_FILE##*.}"
-          curl -sL -o "sdk.tar.${EXT}" "${BASE_URL}/${TARGET_PATH}/${SDK_FILE}"
-          
-          if [ "$EXT" = "zst" ]; then
-            tar -I zstd -xf "sdk.tar.${EXT}"
-            rm "sdk.tar.${EXT}"
-          else
-            tar -xf "sdk.tar.${EXT}"
-            rm "sdk.tar.${EXT}"
-          fi
-          
-          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -1)
-          echo "dir=${SDK_DIR}" >> $GITHUB_OUTPUT
-          echo "SDK_DIR=${SDK_DIR}" >> $GITHUB_ENV
-
-      - name: Configure feed
+- name: Configure feed
         env:
           FEED_DIR: ${{ github.workspace }}
         run: |
           cd ${{ steps.sdk.outputs.dir }}
+          
+          # 1. 如果 feeds.conf 不存在，才从模板复制
           [ -f feeds.conf ] || cp feeds.conf.default feeds.conf
           
-          # 1. 引入官方的 packages 库源，确保编译 cups 时所需的依赖项（如 zlib, libpng）能被自动拉取
-          echo "src-git packages https://github.com/openwrt/packages.git;openwrt-${OPENWRT_VERSION}" >> feeds.conf
+          # 2. 【核心修复】安全检查：只有当 feeds.conf 里面没有 packages 源时，才追加写入
+          if ! grep -q "name 'packages'" feeds.conf && ! grep -q "^src-.* packages " feeds.conf; then
+            echo "src-git packages https://github.com/openwrt/packages.git;openwrt-${OPENWRT_VERSION}" >> feeds.conf
+          fi
+          
+          # 3. 写入你本地的 link 源（如果重复则先清理）
+          sed -i '/openprinting_cups/d' feeds.conf
           echo "src-link openprinting_cups $FEED_DIR" >> feeds.conf
           
+          # 4. 强行刷新并安装组件
           ./scripts/feeds update -a
           
-          # 2. 安装全部相关组件
           ./scripts/feeds install -p openprinting_cups -f cups
-          # 顺便把官方自带的打印机驱动过滤组件拉进来备用
-          ./scripts/feeds install -p packages cups-filters foo2zjs
+          ./scripts/feeds install -p packages cups-filters
           
           make defconfig 2>/dev/null || true
-
-      - name: Build CUPS packages
-        run: |
-          cd ${{ steps.sdk.outputs.dir }}
-          # 优先编译依赖库，再编译核心
-          make package/cups/compile -j$(nproc) V=s
-
-      - name: Upload packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: cups-${{ matrix.arch }}-packages
-          path: |
-            openwrt-sdk-*/bin/**/*.ipk
-          if-no-files-found: warn
-
-      - name: Upload build logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cups-${{ matrix.arch }}-logs
-          path: openwrt-sdk-*/logs/
-          if-no-files-found: ignore
-
-  release:
-    name: Publish CUPS OpenWrt packages
-    needs: build
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Read PKG_VERSION from Makefile
-        id: version
-        run: |
-          # 核心修复：动态探测你仓库里 Makefile 的真实相对位置
-          MAKEFILE_PATH=$(find . -name "Makefile" | grep -i "cups" | head -1)
-          if [ -n "$MAKEFILE_PATH" ]; then
-            PKG_VERSION=$(grep -E '^PKG_VERSION:=' "$MAKEFILE_PATH" | cut -d= -f2 | tr -d ' \r\n')
-          else
-            PKG_VERSION="2.4.19"
-          fi
-          echo "PKG_VERSION=${PKG_VERSION}" >> $GITHUB_ENV
-          echo "pkg_version=${PKG_VERSION}" >> $GITHUB_OUTPUT
-
-      - name: Download built packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: cups-*-packages
-          merge-multiple: true
-          path: dist
-
-      - name: Create GitHub Release and upload assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.pkg_version }}-openwrt-${{ env.OPENWRT_VERSION }}-${{ github.run_number }}
-          name: CUPS ${{ steps.version.outputs.pkg_version }} packages for OpenWrt ${{ env.OPENWRT_VERSION }}
-          draft: false
-          prerelease: false
-          files: |
-            dist/**/*.ipk

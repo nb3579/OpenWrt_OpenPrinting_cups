@@ -1,5 +1,5 @@
 # 从 downloads.openwrt.org 下载 SDK，产出 .ipk（opkg 格式，完美适配 22.03.x）
-name: Build CUPS for OpenWrt
+name: Build CUPSdriver for OpenWrt
 
 on:
   push:
